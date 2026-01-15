@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Takeaway Shooting - Definitivo</title>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="https://cdn.jsdelivr.net/npm/jwt-decode/build/jwt-decode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/uuid@9.0.0/dist/umd/uuidv4.min.js"></script>
+<style>
+body{margin:0;background:#111;display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;}
+canvas{image-rendering: pixelated;border:3px solid #000;background:#87ceeb;display:none;}
+#overlay{position:absolute;top:0;left:0;width:100%;height:100%;display:flex;flex-direction:column;align-items:center;color:white;font-size:24px;}
+.button,.menu-button,.friend-button{background:#333;padding:10px 20px;margin:5px;cursor:pointer;border:2px solid #fff;}
+.button:hover,.menu-button:hover,.friend-button:hover{background:#555;}
+.title{font-size:32px;margin-bottom:20px;}
+#coins{margin-top:10px;font-size:20px;}
+input[name=username],input[name=friend]{padding:5px;margin:5px;}
+</style>
+</head>
+<body>
+<div id="overlay">
+  <div class="title">Takeaway Shooting</div>
+  <div id="login-section">
+    <div id="g_id_onload" data-client_id="YOUR_CLIENT_ID_HERE" data-login_uri="" data-auto_prompt="false"></div>
+    <div class="g_id_signin" data-type="standard"></div>
+  </div>
+  <div id="coins">Monedas: 0</div>
+  <div id="menu" style="display:none;flex-direction:column;align-items:center;">
+    <input type="text" id="username" placeholder="Tu nombre">
+    <button class="menu-button" onclick="startGameLocal(1)">1 Jugador (IA)</button>
+    <button class="menu-button" onclick="startGameLocal(2)">2 Jugadores Local</button>
+    <button class="menu-button" onclick="startGameOnline()">Modo Online</button>
+    <button class="menu-button" onclick="skipLogin()">Jugar sin iniciar sesión</button>
+    <div style="margin-top:10px;">
+      <input type="text" id="friendID" placeholder="Agregar amigo por ID">
+      <button class="friend-button" onclick="addFriend()">Agregar Amigo</button>
+      <div id="friendsList"></div>
+    </div>
+  </div>
+</div>
+<canvas id="game" width="800" height="400"></canvas>
+<script>
+// --- Usuario ---
+let userProfile=null, coins=0, userID=uuidv4(), username="Jugador", friends=[], unlockedSkins=[0,1,2,3];
+
+// --- Login Google ---
+function handleCredentialResponse(response){
+  const data = jwt_decode(response.credential);
+  userProfile = data;
+  username = userProfile.name || "Jugador";
+  const emailKey = "coins_"+userProfile.email;
+  if(!localStorage.getItem(emailKey)){ coins=100; localStorage.setItem(emailKey, coins); }
+  else coins=parseInt(localStorage.getItem(emailKey));
+  document.getElementById("coins").innerText="Monedas: "+coins;
+  showMenu();
+}
+function showMenu(){ document.getElementById("login-section").style.display="none"; document.getElementById("menu").style.display="flex"; }
+function skipLogin(){ username=document.getElementById("username").value||"Jugador"; document.getElementById("login-section").style.display="none"; showMenu();}
+function addFriend(){let fid=document.getElementById("friendID").value; if(fid&&!friends.includes(fid)){friends.push(fid); updateFriendList();}}
+function updateFriendList(){document.getElementById("friendsList").innerText="Amigos: "+friends.join(", ");}
+
+// --- Juego ---
+let canvas=document.getElementById("game"), ctx=canvas.getContext("2d");
+let keys={}, players=[], viewports=[], weapons=[], gameStarted=false;
+const MAP_LENGTH=2500, CHECKPOINTS=[400,800,1200,1600,2000], BULLETS=[], EXPLOSIONS=[];
+
+// --- Skins 25 pixel art embebidas ---
+const SKINS=[];
+for(let i=0;i<25;i++){
+  let c=document.createElement("canvas"); c.width=16;c.height=16;let ctx2=c.getContext("2d");
+  ctx2.fillStyle="hsl("+(i*14)+",100%,50%)"; ctx2.fillRect(0,0,16,16);
+  ctx2.fillStyle="white"; ctx2.fillRect(4,4,2,2); ctx2.fillRect(10,4,2,2); // ojos
+  ctx2.fillStyle="black"; ctx2.fillRect(5,12,6,2); // boca
+  SKINS.push(c.toDataURL());
+}
+
+// --- Armas pixel art ---
+function createColorSprite(color){let c=document.createElement("canvas");c.width=16;c.height=16;let ctx2=c.getContext("2d");ctx2.fillStyle=color;ctx2.fillRect(0,0,16,16);return c.toDataURL();}
+const SPRITES={sniper:createColorSprite("silver"),bazooka:createColorSprite("red"),pistola:createColorSprite("black"),ametralladora:createColorSprite("brown"),escudo:createColorSprite("blue"),botiquin:createColorSprite("green"),bomba:createColorSprite("orange")};
+
+// --- Mapas pixel art (texturas simples embebidas) ---
+const MAP_TEXTURES=[];
+for(let m=0;m<8;m++){
+  let c=document.createElement("canvas"); c.width=64;c.height=64; let ctx2=c.getContext("2d");
+  ctx2.fillStyle="hsl("+(m*40)+",50%,50%)"; ctx2.fillRect(0,0,64,64);
+  ctx2.fillStyle="darkgreen"; for(let i=0;i<8;i++){ctx2.fillRect(i*8,48,4,16);}
+  MAP_TEXTURES.push(c.toDataURL());
+}
+
+// --- Clases ---
+class Player{
+  constructor(x,color,controls,skinIndex=0,isAI=false,isOnline=false){
+    this.x=x; this.y=200; this.w=32; this.h=32; this.vx=0; this.vy=0; this.onGround=false;
+    this.life=100; this.color=color; this.controls=controls; this.isAI=isAI; this.isOnline=isOnline;
+    this.currentWeapon=null; this.skinIndex=skinIndex; this.sprite=new Image(); this.sprite.src=SKINS[this.skinIndex];
+  }
+  update(){ 
+    if(keys[this.controls?.left]) this.vx=-3; else if(keys[this.controls?.right]) this.vx=3; else this.vx=0;
+    if(this.onGround && keys[this.controls?.jump]){ this.vy=-6; this.onGround=false; }
+    this.vy+=0.3; this.y+=this.vy; this.x+=this.vx;
+    if(this.y>368){this.y=368; this.vy=0; this.onGround=true;}
+  }
+  draw(camX,camY,viewport){ 
+    ctx.drawImage(this.sprite,this.x-camX,viewport.y+this.y,32,32);
+    ctx.fillStyle="red"; ctx.fillRect(this.x-camX,viewport.y+this.y-6,this.life/100*32,4);
+  }
+}
+
+class Weapon{
+  constructor(x,type,sprite){this.x=x; this.type=type; this.active=true; this.sprite=new Image(); this.sprite.src=sprite;}
+  draw(camX,viewport){if(this.active)ctx.drawImage(this.sprite,this.x-camX,viewport.y+350,16,16);}
+}
+
+class Bullet{
+  constructor(x,y,targetX,targetY,type,player){this.x=x;this.y=y;this.tx=targetX;this.ty=targetY;this.type=type;this.timer=0;this.player=player;}
+  update(){this.timer+=1/60;if((this.type=="bazooka" && this.timer>=5) || (this.type=="bomba" && this.timer>=7) || (this.type!="bazooka" && this.type!="bomba" && this.timer>=1)){EXPLOSIONS.push(new Explosion(this.tx,this.ty,this.type,this.player)); return false;} return true;}
+  draw(camX,viewport){ctx.fillStyle=this.type=="bazooka"||this.type=="bomba"?"orange":"yellow"; ctx.fillRect(this.x-camX,this.y,4,4);}
+}
+
+class Explosion{
+  constructor(x,y,type,player){this.x=x; this.y=y; this.type=type; this.radius=0; this.max=this.type=="bazooka"||this.type=="bomba"?60:20; this.player=player;}
+  update(){this.radius+=2; return this.radius<this.max;}
+  draw(camX,viewport){ctx.fillStyle="rgba(255,165,0,0.5)"; ctx.beginPath(); ctx.arc(this.x-camX,this.y,this.radius,0,Math.PI*2); ctx.fill();}
+}
+
+function initWeapons(){weapons=[]; const types=["sniper","pistola","ametralladora","escudo","botiquin","bazooka","bomba"];
+for(let i=0;i<15;i++){let type=types[Math.floor(Math.random()*types.length)];weapons.push(new Weapon(Math.random()*MAP_LENGTH,type,SPRITES[type]));}}
+
+// --- Modos ---
+function startGameLocal(count){
+  document.getElementById("menu").style.display="none"; canvas.style.display="block"; initWeapons();
+  players=[]; viewports=[];
+  for(let i=0;i<count;i++){
+    let controls=i==0?{left:"a",right:"d",jump:"w",shoot:"s"}:{left:"ArrowLeft",right:"ArrowRight",jump:"ArrowUp",shoot:"ArrowDown"};
+    let p=new Player(50+i*50,i==0?"#ff4444":"#44ff44",controls,unlockedSkins[i%unlockedSkins.length]);
+    players.push(p); viewports.push({x:0,y:i*canvas.height/count,w:canvas.width,h:canvas.height/count});
+  }
+  gameStarted=true; loop();
+}
+function startGameOnline(){
+  document.getElementById("menu").style.display="none"; canvas.style.display="block"; initWeapons();
+  players=[]; viewports=[];
+  for(let i=0;i<4;i++){
+    let controls=i==0?{left:"a",right:"d",jump:"w",shoot:"s"}:null;
+    let p=new Player(50+i*50,i==0?"#ff4444":"#44ff44",controls,unlockedSkins[i%unlockedSkins.length],true,true);
+    players.push(p); viewports.push({x:0,y:i*canvas.height/4,w:canvas.width,h:canvas.height/4});
+  }
+  gameStarted=true; loop();
+}
+
+// --- Loop ---
+function loop(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  for(let i=0;i<players.length;i++){
+    let p=players[i]; let vp=viewports[i];
+    let camX=Math.min(Math.max(p.x-vp.w/2,0),MAP_LENGTH-vp.w);
+    // Fondo mapa
+    let img = new Image(); img.src=MAP_TEXTURES[0]; ctx.fillStyle="#3a5"; ctx.fillRect(-camX,vp.y+368,MAP_LENGTH,32);
+    ctx.fillStyle="green"; CHECKPOINTS.forEach(cp=>ctx.fillRect(cp-camX,vp.y+358,10,10));
+    p.update(); p.draw(camX,0,vp);
+    weapons.forEach(w=>w.draw(camX,vp));
+  }
+  // Actualizar balas
+  for(let i=BULLETS.length-1;i>=0;i--){if(!BULLETS[i].update()) BULLETS.splice(i,1);}
+  for(let b of BULLETS) b.draw(0,{});
+  // Actualizar explosiones
+  for(let i=EXPLOSIONS.length-1;i>=0;i--){if(!EXPLOSIONS[i].update()) EXPLOSIONS.splice(i,1);}
+  for(let e of EXPLOSIONS) e.draw(0,{});
+  requestAnimationFrame(loop);
+}
+
+window.addEventListener("keydown",e=>keys[e.key]=true);
+window.addEventListener("keyup",e=>keys[e.key]=false);
+window.handleCredentialResponse=handleCredentialResponse;
+</script>
+</body>
+</html>
